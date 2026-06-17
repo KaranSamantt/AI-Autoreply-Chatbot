@@ -1,0 +1,37 @@
+The script runs a polling loop that turns screen pixels into a conversational agent. Here's the flow:
+Setup (lines 1–15)
+
+A Groq client is initialized with a hardcoded API key. pyautogui.FAILSAFE = False disables the safety feature that normally aborts pyautogui if your mouse hits a screen corner — risky, since you lose your emergency kill switch. Three constants define where on your screen things are: the chat region to screenshot, and the pixel coordinates of the input box and send button.
+The main loop (bottom of the file)
+
+This is the heart of the program, running forever:
+
+Take a screenshot of CHAT_REGION.
+Ask a vision model "whose message is last, and what does it say?"
+If it's a new message from the other person (not a repeat, not your own message) → generate a reply and send it.
+Sleep, repeat.
+
+It's a classic poll-detect-act cycle — no event listeners, no webhooks, just "check every few seconds and react if something changed."
+capture_screenshot_base64
+
+Takes the (x1, y1, x2, y2) region tuple, converts it to pyautogui's expected (x, y, width, height) format, grabs that slice of the screen, and encodes it as base64 PNG — the format the Groq vision API needs for image input.
+analyze_chat — the "who spoke last" detector
+
+This sends the screenshot to llama-4-scout (a vision-capable model) with a prompt that does double duty: identify the speaker of the last message and transcribe it verbatim. It's instructed to return the literal string NO_REPLY if the last message is yours (so the bot doesn't reply to itself), otherwise to return the other person's exact text with no paraphrasing. temperature=0.0 is correct here — you want deterministic, literal transcription, not creative variation.
+The function then translates that string output into a (message, should_reply) tuple — (None, False) if nothing new to reply to, otherwise (message, True).
+generate_reply — the personality engine
+
+This sends only the single detected message (no conversation history) to llama-3.3-70b-versatile with a system prompt that locks in a persona: "Karan, 22, replies in casual Hinglish, 1 sentence max, lowercase, uses emojis/fillers like haha/yaar/bhai." temperature=1.0 is intentional — you want varied, natural-sounding short replies rather than the same canned response every time.
+send_message
+
+Clicks the input box, copies the reply text to the clipboard, pastes with Ctrl+V (faster and more reliable than typing character-by-character, and avoids issues with emoji/Unicode that pyautogui.typewrite can't handle), then clicks send. The time.sleep() calls between actions exist because UI actions aren't instant — clicking too fast after pasting can click before the paste registers.
+The dedup logic — why last_replied_to and replied_this_cycle exist
+
+This is the trickiest part and worth understanding precisely:
+
+last_replied_to prevents replying to the same message twice across loop iterations (since the screenshot will still show that message as "last" until a new one arrives).
+replied_this_cycle is reset to False at the bottom of every loop iteration where nothing happened, but set to True immediately after sending a reply — this is essentially redundant with the last_replied_to check in the current code, since both conditions are checked together with and. In practice replied_this_cycle does nothing useful here that last_replied_to doesn't already cover within a single iteration (it's always False when checked, since it gets reset every loop). It's dead logic — a sign the dedup mechanism could be simplified to just the incoming != last_replied_to check.
+
+Why this is fragile by design
+
+Every "decision" (who spoke last, what they said) is re-derived from a fresh screenshot every single cycle — there's no persistent state about the conversation beyond the last single message string. That means: no memory of earlier exchanges, no handling of multiple unread messages arriving between polls (only the last one is seen), and total dependence on the vision model correctly parsing UI layout each time.
